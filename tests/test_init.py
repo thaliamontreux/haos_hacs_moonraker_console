@@ -1,0 +1,1970 @@
+"""Test moonraker setup process."""
+
+import asyncio
+import logging
+from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from custom_components.moonraker.const import PRINTSTATES
+
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.update_coordinator import (
+    DataUpdateCoordinator,
+    UpdateFailed,
+)
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
+
+from custom_components.moonraker import (
+    _PRINTING_SCAN_INTERVAL,
+    MoonrakerDataUpdateCoordinator,
+    _async_is_tcp_reachable,
+    _build_thumbnail_path,
+    _entry_polling_interval,
+    async_migrate_entry,
+    _normalize_gcode_path,
+    _normalize_moonraker_port,
+    _strip_gcode_root,
+    async_reload_entry,
+    async_setup_entry,
+    async_unload_entry,
+)
+from custom_components.moonraker.const import (
+    CONF_OPTION_POLLING_RATE,
+    CONF_OPTION_QUIET_UNREACHABLE,
+    CONF_PORT,
+    DEFAULT_PORT,
+    DOMAIN,
+    METHODS,
+    NOTIFY_GCODE_RESPONSE,
+    NOTIFY_KLIPPY_DISCONNECTED,
+    NOTIFY_KLIPPY_READY,
+    NOTIFY_KLIPPY_SHUTDOWN,
+    NOTIFY_STATUS_UPDATE,
+    OBJ,
+    PUSH_UPDATE_INTERVAL,
+)
+
+from .const import MOCK_CONFIG, MOCK_CONFIG_WITH_NAME
+
+
+@pytest.fixture(name="bypass_connect_client", autouse=True)
+def bypass_connect_client_fixture():
+    """Skip calls to get data from API."""
+    with (
+        patch("custom_components.moonraker.MoonrakerApiClient.start"),
+        patch("custom_components.moonraker.MoonrakerApiClient.stop"),
+        patch(
+            "custom_components.moonraker._async_is_tcp_reachable",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+    ):
+        yield
+
+
+def test_normalize_moonraker_port_uses_default_for_empty_values():
+    """Empty configured ports should use the Moonraker default port."""
+    assert _normalize_moonraker_port("") == DEFAULT_PORT
+    assert _normalize_moonraker_port(None) == DEFAULT_PORT
+
+
+def test_normalize_moonraker_port_converts_configured_values():
+    """Configured ports should be converted to integers for socket probing."""
+    assert _normalize_moonraker_port("7611") == 7611
+    assert _normalize_moonraker_port(7611) == 7611
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({}, 40),
+        ({CONF_OPTION_POLLING_RATE: 0}, 7),
+        ({CONF_OPTION_POLLING_RATE: 2}, 7),
+        ({CONF_OPTION_POLLING_RATE: 45}, 45),
+        ({CONF_OPTION_POLLING_RATE: "invalid"}, 40),
+        ({CONF_OPTION_POLLING_RATE: None}, 40),
+    ],
+)
+def test_entry_polling_interval_is_safe(options, expected):
+    """Polling intervals should be per-entry and never fall below seven seconds."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, options=options, entry_id="polling"
+    )
+
+    assert _entry_polling_interval(config_entry) == timedelta(seconds=expected)
+
+
+@pytest.mark.parametrize(
+    ("polling_rate", "expected"),
+    [(30, 40), (5, 7), (45, 60), ("invalid", 40), (None, 40)],
+)
+async def test_migrate_polling_options(hass, polling_rate, expected):
+    """Existing polling options migrate to intervals with 25% fewer polls."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CONFIG,
+        options={CONF_OPTION_POLLING_RATE: polling_rate},
+        entry_id="polling-migration",
+        version=1,
+    )
+    config_entry.add_to_hass(hass)
+
+    assert await async_migrate_entry(hass, config_entry)
+    assert config_entry.version == 2
+    assert config_entry.options[CONF_OPTION_POLLING_RATE] == expected
+
+
+async def test_migrate_polling_options_missing_and_future_versions(hass):
+    """Missing polling options use the new default; future versions are untouched."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, entry_id="polling-migration", version=1
+    )
+    config_entry.add_to_hass(hass)
+    assert await async_migrate_entry(hass, config_entry)
+    assert CONF_OPTION_POLLING_RATE not in config_entry.options
+    assert config_entry.version == 2
+
+    future_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, entry_id="polling-future", version=2
+    )
+    assert not await async_migrate_entry(hass, future_entry)
+    assert future_entry.version == 2
+
+
+def test_normalize_gcode_path_empty():
+    """Return empty parts for empty input."""
+    assert _normalize_gcode_path("") == ("", None)
+    assert _normalize_gcode_path(None) == ("", None)
+
+
+def test_normalize_gcode_path_whitespace():
+    """Return empty parts for whitespace-only input."""
+    assert _normalize_gcode_path("   ") == ("", None)
+
+
+def test_normalize_gcode_path_with_root_prefix():
+    """Strip gcodes root from relative paths."""
+    filename, root = _normalize_gcode_path("gcodes/subdir/file.gcode")
+    assert filename == "subdir/file.gcode"
+    assert root == "gcodes"
+
+
+def test_normalize_gcode_path_with_absolute_path():
+    """Extract gcodes root from absolute paths."""
+    filename, root = _normalize_gcode_path(
+        "/home/user/printer_data/gcodes/subdir/file.gcode"
+    )
+    assert filename == "subdir/file.gcode"
+    assert root == "gcodes"
+
+
+def test_strip_gcode_root_prefix():
+    """Strip root prefix from thumbnail paths."""
+    assert _strip_gcode_root("gcodes/.thumbs/file.png", "gcodes") == ".thumbs/file.png"
+
+
+def test_strip_gcode_root_none_path():
+    """Return empty string when path is None."""
+    assert _strip_gcode_root(None, "gcodes") == ""
+
+
+def test_strip_gcode_root_whitespace_path():
+    """Return empty string when path is whitespace."""
+    assert _strip_gcode_root("   ", "gcodes") == ""
+
+
+def test_strip_gcode_root_absolute():
+    """Strip root prefix when embedded in an absolute path."""
+    assert (
+        _strip_gcode_root("/home/user/gcodes/.thumbs/file.png", "gcodes")
+        == ".thumbs/file.png"
+    )
+
+
+def test_strip_gcode_root_without_root():
+    """Leave paths untouched when no root is provided."""
+    assert (
+        _strip_gcode_root("subfolder/.thumbs/file.png", None)
+        == "subfolder/.thumbs/file.png"
+    )
+
+
+def test_strip_gcode_root_without_root_prefix():
+    """Strip gcodes prefix even without an explicit root."""
+    assert _strip_gcode_root("gcodes/.thumbs/file.png", None) == ".thumbs/file.png"
+
+
+def test_build_thumbnail_path_reuses_existing_dir():
+    """Avoid duplicating directory segments."""
+    assert (
+        _build_thumbnail_path("subfolder", "subfolder/.thumbs/file.png", "gcodes")
+        == "subfolder/.thumbs/file.png"
+    )
+
+
+def test_build_thumbnail_path_missing_thumbnail():
+    """Return None when thumbnail path is missing."""
+    assert _build_thumbnail_path("subfolder", None, "gcodes") is None
+
+
+def test_build_thumbnail_path_only_dot_prefix():
+    """Return None when thumbnail path is only './'."""
+    assert _build_thumbnail_path("subfolder", "./", "gcodes") is None
+
+
+def test_build_thumbnail_path_joins_dir():
+    """Join the gcode directory when thumbnails are relative."""
+    assert (
+        _build_thumbnail_path("subfolder", ".thumbs/file.png", "gcodes")
+        == "subfolder/.thumbs/file.png"
+    )
+
+
+def test_build_thumbnail_path_empty_dir_after_strip():
+    """Return thumbnail path when directory collapses to empty."""
+    assert (
+        _build_thumbnail_path("/", ".thumbs/file.png", "gcodes") == ".thumbs/file.png"
+    )
+
+
+def test_build_thumbnail_path_strips_dot_prefix():
+    """Trim leading ./ for URL usage."""
+    assert (
+        _build_thumbnail_path("", "./.thumbs/file.png", "gcodes") == ".thumbs/file.png"
+    )
+
+
+async def test_gcode_detail_skips_empty_normalized_filename(hass):
+    """Return defaults when normalized filename is empty."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+
+    result = await coordinator._async_get_gcode_file_detail("/")
+
+    assert result["thumbnails_path"] is None
+    assert result["layer_count"] is None
+
+
+async def test_gcode_detail_missing_thumbnails_skips_warning(hass, caplog):
+    """Missing thumbnail metadata should not emit warnings."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    gcode_data = {
+        "estimated_time": 10,
+        "object_height": 5.5,
+        "filament_total": 1.2,
+        "layer_count": 20,
+        "layer_height": 0.2,
+        "first_layer_height": 0.3,
+        "gcode_start_byte": 100,
+        "gcode_end_byte": 200,
+    }
+    coordinator._async_fetch_data = AsyncMock(return_value=gcode_data)
+
+    with caplog.at_level(logging.WARNING):
+        result = await coordinator._async_get_gcode_file_detail("example.gcode")
+
+    coordinator._async_fetch_data.assert_awaited_once_with(
+        METHODS.SERVER_FILES_METADATA, {"filename": "example.gcode"}
+    )
+    assert result["thumbnails_path"] is None
+    assert result["estimated_time"] == 10
+    assert result["object_height"] == 5.5
+    assert result["filament_total"] == 1.2
+    assert result["layer_count"] == 20
+    assert result["layer_height"] == 0.2
+    assert result["first_layer_height"] == 0.3
+    assert result["gcode_start_byte"] == 100
+    assert result["gcode_end_byte"] == 200
+    assert "failed to get thumbnails" not in caplog.text
+
+
+async def test_gcode_detail_caches_metadata_for_same_file(hass):
+    """Metadata requests should be limited to a file change."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    metadata = {"estimated_time": 60, "thumbnails": []}
+    coordinator._async_fetch_data = AsyncMock(return_value=metadata)
+
+    first_result = await coordinator._async_get_gcode_file_detail("gcodes/file.gcode")
+    second_result = await coordinator._async_get_gcode_file_detail("gcodes/file.gcode")
+
+    coordinator._async_fetch_data.assert_awaited_once_with(
+        METHODS.SERVER_FILES_METADATA, {"filename": "file.gcode"}
+    )
+    assert first_result == second_result
+    assert second_result["estimated_time"] == 60
+
+
+async def test_gcode_detail_metadata_failure_returns_cached_defaults(hass):
+    """Metadata failures should not fail coordinator updates or retry each poll."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator._async_fetch_data = AsyncMock(side_effect=UpdateFailed)
+
+    first_result = await coordinator._async_get_gcode_file_detail("file.gcode")
+    second_result = await coordinator._async_get_gcode_file_detail("file.gcode")
+
+    coordinator._async_fetch_data.assert_awaited_once_with(
+        METHODS.SERVER_FILES_METADATA, {"filename": "file.gcode"}
+    )
+    assert first_result == second_result
+    assert second_result["thumbnails_path"] is None
+
+
+async def test_gcode_detail_thumbnail_selection_ignores_invalid_entries(hass):
+    """Pick the best thumbnail while ignoring invalid entries."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    gcode_data = {
+        "thumbnails": [
+            "not-a-dict",
+            {"size": 12},
+            {"relative_path": ".thumbs/fallback.png", "size": "bad"},
+            {"relative_path": ".thumbs/best.png", "size": 999},
+        ]
+    }
+    coordinator._async_fetch_data = AsyncMock(return_value=gcode_data)
+
+    result = await coordinator._async_get_gcode_file_detail("subdir/file.gcode")
+
+    coordinator._async_fetch_data.assert_awaited_once_with(
+        METHODS.SERVER_FILES_METADATA, {"filename": "subdir/file.gcode"}
+    )
+    assert result["thumbnails_path"] == "subdir/.thumbs/best.png"
+
+
+async def test_gcode_detail_thumbnail_selection_missing_paths(hass):
+    """Return without thumbnail when no valid paths are provided."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    gcode_data = {"thumbnails": ["not-a-dict", {"size": 12}, {"relative_path": ""}]}
+    coordinator._async_fetch_data = AsyncMock(return_value=gcode_data)
+
+    result = await coordinator._async_get_gcode_file_detail("file.gcode")
+
+    coordinator._async_fetch_data.assert_awaited_once_with(
+        METHODS.SERVER_FILES_METADATA, {"filename": "file.gcode"}
+    )
+    assert result["thumbnails_path"] is None
+
+
+async def test_add_query_objects_ignores_keys_after_full_object(hass):
+    """Skip adding keys when object is already set to fetch all fields."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+
+    coordinator.add_query_objects("gcode_macro TEST", None)
+    assert coordinator.query_obj[OBJ]["gcode_macro TEST"] is None
+
+    coordinator.add_query_objects("gcode_macro TEST", "variable_1")
+    assert coordinator.query_obj[OBJ]["gcode_macro TEST"] is None
+
+
+async def test_coordinator_caches_setup_lookups(hass):
+    """Static setup lookups should only call Moonraker once per entry."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="cache")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    objects = {"objects": ["fan"]}
+    settings = {"status": {"configfile": {"settings": {}}}}
+    system_info = {"system_info": {"available_services": []}}
+    server_info = {"moonraker_version": "v0.9.0", "api_version": [1, 0, 0]}
+    coordinator._async_fetch_data = AsyncMock(
+        side_effect=[objects, settings, system_info, server_info]
+    )
+
+    assert await coordinator.async_get_printer_objects() == objects
+    assert await coordinator.async_get_printer_objects() == objects
+    assert await coordinator.async_get_config_settings() == settings
+    assert await coordinator.async_get_config_settings() == settings
+    assert await coordinator.async_get_system_info() == system_info
+    assert await coordinator.async_get_system_info() == system_info
+    assert await coordinator.async_get_server_info() == server_info
+    assert await coordinator.async_get_server_info() == server_info
+    assert coordinator._async_fetch_data.await_count == 4
+
+
+async def test_coordinator_caches_unavailable_server_info(hass):
+    """Do not repeatedly request optional server info after an initial failure."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, entry_id="server-info"
+    )
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator._async_fetch_data = AsyncMock(side_effect=UpdateFailed("unavailable"))
+
+    assert await coordinator.async_get_server_info() == {}
+    assert await coordinator.async_get_server_info() == {}
+    coordinator._async_fetch_data.assert_awaited_once_with(
+        METHODS.SERVER_INFO, None, quiet=True
+    )
+
+
+async def test_coordinator_refreshes_only_unqueried_status_fields(hass):
+    """Setup-time subscription changes should avoid a full coordinator refresh."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="query")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator.data = {
+        "status": {"print_stats": {"state": "printing", "print_duration": 10}}
+    }
+    coordinator._record_queried_objects(coordinator.query_obj[OBJ])
+    coordinator.add_query_objects("print_stats", "new_field")
+    coordinator.add_query_objects("extra_sensor", "temperature")
+    coordinator._async_fetch_data = AsyncMock(
+        return_value={
+            "status": {
+                "print_stats": {"new_field": 42},
+                "extra_sensor": {"temperature": 23},
+            }
+        }
+    )
+
+    await coordinator.async_refresh_query_data()
+
+    coordinator._async_fetch_data.assert_awaited_once_with(
+        METHODS.PRINTER_OBJECTS_QUERY,
+        {OBJ: {"print_stats": ["new_field"], "extra_sensor": ["temperature"]}},
+        quiet=True,
+    )
+    assert coordinator.data["status"]["print_stats"] == {
+        "state": "printing",
+        "print_duration": 10,
+        "new_field": 42,
+    }
+    assert coordinator.data["status"]["extra_sensor"]["temperature"] == 23
+
+    await coordinator.async_refresh_query_data()
+    assert coordinator._async_fetch_data.await_count == 1
+
+
+async def test_coordinator_fetches_all_fields_after_full_object_subscription(hass):
+    """A later full-object subscription should fetch fields not previously queried."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="full")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator.data = {"status": {"gcode_macro TEST": {"variable": 1}}}
+    coordinator.add_query_objects("gcode_macro TEST", "variable")
+    coordinator._record_queried_objects(coordinator._subscription_objects())
+    coordinator.add_query_objects("gcode_macro TEST", None)
+    coordinator._async_fetch_data = AsyncMock(
+        return_value={"status": {"gcode_macro TEST": {"variable": 1, "other": 2}}}
+    )
+
+    await coordinator.async_refresh_query_data()
+
+    coordinator._async_fetch_data.assert_awaited_once_with(
+        METHODS.PRINTER_OBJECTS_QUERY,
+        {OBJ: {"gcode_macro TEST": None}},
+        quiet=True,
+    )
+    assert coordinator.data["status"]["gcode_macro TEST"]["other"] == 2
+
+    coordinator.add_query_objects("gcode_macro TEST", "another_variable")
+    await coordinator.async_refresh_query_data()
+    assert coordinator._async_fetch_data.await_count == 1
+
+
+async def test_status_notification_flushes_on_print_state_change(hass):
+    """Print-state pushes should merge and dispatch immediately."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="push")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator.data = {"status": {"print_stats": {"state": "standby"}}}
+    coordinator.async_update_listeners = MagicMock()
+
+    await coordinator._async_handle_notification(
+        NOTIFY_STATUS_UPDATE, [{"print_stats": {"state": "printing"}}, 1.0]
+    )
+
+    assert coordinator.data["status"]["print_stats"]["state"] == "printing"
+    coordinator.async_update_listeners.assert_called_once()
+    assert coordinator.update_interval == _PRINTING_SCAN_INTERVAL
+
+
+async def test_status_notification_debounces_dispatch(hass):
+    """Rapid pushes should dispatch at most once per push interval."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="push")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator.data = {"status": {"print_stats": {"state": "printing"}}}
+    coordinator.async_update_listeners = MagicMock()
+
+    for temperature in (210.0, 211.0, 212.0):
+        await coordinator._async_handle_notification(
+            NOTIFY_STATUS_UPDATE, [{"extruder": {"temperature": temperature}}]
+        )
+
+    assert coordinator.data["status"]["extruder"]["temperature"] == 212.0
+    coordinator.async_update_listeners.assert_not_called()
+    assert coordinator._push_unsub is not None
+
+    async_fire_time_changed(
+        hass, dt_util.utcnow() + timedelta(seconds=PUSH_UPDATE_INTERVAL + 1)
+    )
+    await hass.async_block_till_done()
+
+    coordinator.async_update_listeners.assert_called_once()
+
+
+async def test_notification_ignores_other_methods(hass):
+    """Non-status notifications should not touch coordinator data."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="push")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator.data = {"status": {}}
+    coordinator.async_update_listeners = MagicMock()
+
+    await coordinator._async_handle_notification(
+        "notify_proc_stat_update", [{"cpu": 1}]
+    )
+
+    assert coordinator.data == {"status": {}}
+    coordinator.async_update_listeners.assert_not_called()
+    assert coordinator._push_unsub is None
+
+
+async def test_subscribe_status_updates_sends_tracked_objects(hass):
+    """Subscription should cover every tracked object and merge the reply."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="sub")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator.add_query_objects("extruder", None)
+    coordinator._async_fetch_data = AsyncMock(
+        return_value={"objects": {"extruder": {"temperature": 20}}}
+    )
+
+    await coordinator.async_subscribe_status_updates()
+
+    args, kwargs = coordinator._async_fetch_data.await_args
+    assert args[0] == METHODS.PRINTER_OBJECTS_SUBSCRIBE
+    assert kwargs == {"quiet": True}
+    subscription = args[1][OBJ]
+    assert subscription["extruder"] is None
+    assert "virtual_sdcard" in subscription
+    assert coordinator._subscribed_to_status
+    assert coordinator.data["status"]["extruder"]["temperature"] == 20
+
+
+async def test_resubscribe_after_reconnect(hass):
+    """A reconnect should restore the status subscription."""
+    client = MagicMock()
+    client.start = AsyncMock()
+    client.client.is_connected = False
+    client.client.call_method = AsyncMock(return_value={})
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="sub")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=client, config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator._subscribed_to_status = True
+
+    await coordinator._async_fetch_data(METHODS.PRINTER_INFO, None)
+
+    calls = [call.args[0] for call in client.client.call_method.await_args_list]
+    assert calls == [
+        METHODS.PRINTER_OBJECTS_SUBSCRIBE.value,
+        METHODS.PRINTER_INFO.value,
+    ]
+
+
+async def test_shutdown_push_updates_detaches_handler(hass):
+    """Unload should cancel pending dispatch and detach the handler."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="push")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator._schedule_push_flush()
+    assert coordinator._push_unsub is not None
+
+    coordinator.async_shutdown_push_updates()
+
+    assert coordinator._push_unsub is None
+    assert coordinator.moonraker.notification_handler is None
+
+
+async def test_klippy_disconnect_marks_data_unavailable(hass):
+    """Klippy disconnect notifications should flag stale data immediately."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="klippy")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator.data = {"status": {}}
+    coordinator.last_update_success = True
+    coordinator.async_update_listeners = MagicMock()
+
+    await coordinator._async_handle_notification(NOTIFY_KLIPPY_DISCONNECTED, None)
+
+    assert not coordinator.last_update_success
+    coordinator.async_update_listeners.assert_called_once()
+
+
+async def test_klippy_shutdown_marks_data_unavailable(hass):
+    """Klippy shutdown notifications should flag stale data immediately."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="klippy")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator.data = {"status": {}}
+    coordinator.last_update_success = True
+    coordinator.async_update_listeners = MagicMock()
+
+    await coordinator._async_handle_notification(NOTIFY_KLIPPY_SHUTDOWN, None)
+
+    assert not coordinator.last_update_success
+    coordinator.async_update_listeners.assert_called_once()
+
+
+async def test_klippy_ready_requests_refresh(hass):
+    """Klippy ready notifications should trigger an immediate refresh."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="klippy")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator.async_request_refresh = AsyncMock()
+
+    await coordinator._async_handle_notification(NOTIFY_KLIPPY_READY, None)
+
+    coordinator.async_request_refresh.assert_awaited_once()
+
+
+async def test_staggered_updater_runs_every_n_cycles(hass):
+    """Updaters registered with every=N should only run on matching cycles."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="stagger")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator._async_fetch_data = AsyncMock(return_value={})
+    slow = AsyncMock(return_value={"slow": True})
+    coordinator.add_data_updater(slow, every=4)
+
+    for _ in range(5):
+        await coordinator._async_update_data()
+
+    assert slow.await_count == 2  # cycles 0 and 4
+
+
+async def test_paused_state_uses_printing_interval(hass):
+    """A paused print is still active and should keep the fast poll interval."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="paused")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator._async_fetch_data = AsyncMock(
+        return_value={
+            "status": {"print_stats": {"state": PRINTSTATES.PAUSED.value}},
+            "printer.info": {},
+        }
+    )
+
+    await coordinator._async_update_data()
+
+    assert coordinator.update_interval == _PRINTING_SCAN_INTERVAL
+
+
+async def test_setup_unload_and_reload_entry(hass):
+    """Test entry setup and unload."""
+    # Create a mock entry so we don't have to go through config flow
+
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+    config_entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    assert DOMAIN in hass.data and config_entry.entry_id in hass.data[DOMAIN]
+    assert isinstance(
+        hass.data[DOMAIN][config_entry.entry_id], MoonrakerDataUpdateCoordinator
+    )
+
+    # Reload the entry and assert that the data from above is still there.
+    hass.config_entries._entries[config_entry.entry_id] = config_entry
+    assert await async_reload_entry(hass, config_entry) is None
+    assert DOMAIN in hass.data and config_entry.entry_id in hass.data[DOMAIN]
+    assert isinstance(
+        hass.data[DOMAIN][config_entry.entry_id], MoonrakerDataUpdateCoordinator
+    )
+
+    # Unload the entry and verify that the data has been removed
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    with patch.object(
+        coordinator.moonraker, "stop", new_callable=AsyncMock
+    ) as stop_client:
+        assert await async_unload_entry(hass, config_entry)
+    stop_client.assert_awaited_once()
+    assert config_entry.entry_id not in hass.data[DOMAIN]
+
+
+async def test_setup_unload_and_reload_entry_with_name(hass):
+    """Test entry setup with name and unload."""
+    # Create a mock entry so we don't have to go through config flow
+
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG_WITH_NAME, entry_id="test"
+    )
+    config_entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    assert DOMAIN in hass.data and config_entry.entry_id in hass.data[DOMAIN]
+    assert isinstance(
+        hass.data[DOMAIN][config_entry.entry_id], MoonrakerDataUpdateCoordinator
+    )
+
+    # Reload the entry and assert that the data from above is still there.
+    hass.config_entries._entries[config_entry.entry_id] = config_entry
+    assert await async_reload_entry(hass, config_entry) is None
+    assert DOMAIN in hass.data and config_entry.entry_id in hass.data[DOMAIN]
+    assert isinstance(
+        hass.data[DOMAIN][config_entry.entry_id], MoonrakerDataUpdateCoordinator
+    )
+
+    # Unload the entry and verify that the data has been removed
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    with patch.object(
+        coordinator.moonraker, "stop", new_callable=AsyncMock
+    ) as stop_client:
+        assert await async_unload_entry(hass, config_entry)
+    stop_client.assert_awaited_once()
+    assert config_entry.entry_id not in hass.data[DOMAIN]
+
+
+@pytest.mark.parametrize(
+    ("printer_info", "expected_name"),
+    [
+        (
+            {
+                "device_type": "Anycubic Kobra 2 Pro",
+                "state": "ready",
+                "state_message": "Printer is ready",
+                "software_version": "",
+            },
+            "Anycubic Kobra 2 Pro",
+        ),
+        (
+            {
+                "state": "ready",
+                "state_message": "Printer is ready",
+                "software_version": "",
+            },
+            MOCK_CONFIG["url"],
+        ),
+    ],
+)
+async def test_setup_entry_without_hostname_uses_fallback_name(
+    hass, get_default_api_response, printer_info, expected_name
+):
+    """Use compatible names when printer.info does not include a hostname."""
+
+    async def load_data(endpoint, *args, **kwargs):
+        if endpoint == METHODS.PRINTER_INFO.value:
+            return printer_info
+
+        return get_default_api_response
+
+    config_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CONFIG,
+        entry_id=f"missing_hostname_{expected_name}",
+    )
+    config_entry.add_to_hass(hass)
+
+    with patch(
+        "moonraker_api.MoonrakerClient.call_method",
+        new_callable=AsyncMock,
+        side_effect=load_data,
+    ):
+        assert await hass.config_entries.async_setup(config_entry.entry_id)
+
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    assert config_entry.title == expected_name
+    assert coordinator.api_device_name == expected_name
+    assert await async_unload_entry(hass, config_entry)
+
+
+async def test_setup_reuses_static_api_responses(hass, get_default_api_response):
+    """Repeated platform discovery should share setup-time API responses."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="cached")
+    config_entry.add_to_hass(hass)
+
+    with patch(
+        "moonraker_api.MoonrakerClient.call_method",
+        new_callable=AsyncMock,
+        return_value=get_default_api_response,
+    ) as call_method:
+        assert await hass.config_entries.async_setup(config_entry.entry_id)
+
+    methods = [call.args[0] for call in call_method.await_args_list]
+    assert methods.count(METHODS.PRINTER_OBJECTS_LIST.value) == 1
+    assert methods.count(METHODS.SERVER_FILES_METADATA.value) == 1
+    assert methods.count(METHODS.MACHINE_SYSTEM_INFO.value) == 1
+    settings_queries = [
+        call
+        for call in call_method.await_args_list
+        if call.args[0] == METHODS.PRINTER_OBJECTS_QUERY.value
+        and call.kwargs.get(OBJ) == {"configfile": ["settings"]}
+    ]
+    assert len(settings_queries) == 1
+
+
+async def test_async_send_data_exception(hass):
+    """Test async_post_exception."""
+
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+
+    with (
+        patch(
+            "moonraker_api.MoonrakerClient.call_method",
+            new_callable=AsyncMock,
+            side_effect=UpdateFailed,
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        coordinator = hass.data[DOMAIN][config_entry.entry_id]
+        assert await coordinator.async_send_data(METHODS.PRINTER_EMERGENCY_STOP)
+
+    assert await async_unload_entry(hass, config_entry)
+
+
+async def test_setup_entry_exception(hass):
+    """Test ConfigEntryNotReady when API raises an exception during entry setup."""
+    with patch(
+        "moonraker_api.MoonrakerClient.call_method",
+        new_callable=AsyncMock,
+        side_effect=Exception,
+    ):
+        config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+        config_entry.add_to_hass(hass)
+
+        with pytest.raises(ConfigEntryNotReady):
+            assert await async_setup_entry(hass, config_entry)
+
+
+async def test_setup_entry_generic_exception_stays_warning_when_option_enabled(
+    hass, caplog
+):
+    """Quiet unreachable mode must not hide non-reachability setup failures."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CONFIG,
+        options={CONF_OPTION_QUIET_UNREACHABLE: True},
+        entry_id="setup_error_quiet",
+    )
+    config_entry.add_to_hass(hass)
+
+    with (
+        patch(
+            "moonraker_api.MoonrakerClient.call_method",
+            new_callable=AsyncMock,
+            side_effect=Exception,
+        ),
+        caplog.at_level(logging.DEBUG),
+        pytest.raises(ConfigEntryNotReady),
+    ):
+        await async_setup_entry(hass, config_entry)
+
+    assert any(
+        record.levelno == logging.WARNING
+        and record.message == "Cannot configure moonraker instance"
+        for record in caplog.records
+    )
+
+
+async def test_setup_entry_unreachable_logs_warning_by_default(hass, caplog):
+    """Unreachable printers keep warning-level visibility unless silenced."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="offline")
+    config_entry.add_to_hass(hass)
+
+    with (
+        patch(
+            "custom_components.moonraker._async_is_tcp_reachable",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        caplog.at_level(logging.DEBUG),
+        pytest.raises(ConfigEntryNotReady),
+    ):
+        await async_setup_entry(hass, config_entry)
+
+    assert "Cannot configure moonraker instance" in caplog.text
+    assert any(
+        record.levelno == logging.WARNING
+        and "Cannot configure moonraker instance" in record.message
+        for record in caplog.records
+    )
+
+
+async def test_setup_entry_empty_port_uses_default_for_reachability_probe(hass):
+    """Empty stored ports remain accepted and are probed as the default port."""
+    config = {**MOCK_CONFIG, CONF_PORT: ""}
+    config_entry = MockConfigEntry(domain=DOMAIN, data=config, entry_id="empty_port")
+    config_entry.add_to_hass(hass)
+
+    with (
+        patch(
+            "custom_components.moonraker._async_is_tcp_reachable",
+            new_callable=AsyncMock,
+            return_value=False,
+        ) as is_reachable,
+        pytest.raises(ConfigEntryNotReady),
+    ):
+        await async_setup_entry(hass, config_entry)
+
+    is_reachable.assert_awaited_once_with("1.2.3.4", DEFAULT_PORT)
+
+
+async def test_setup_entry_unreachable_logs_debug_when_option_enabled(hass, caplog):
+    """Unreachable printers can be configured to avoid warning-level log spam."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CONFIG,
+        options={CONF_OPTION_QUIET_UNREACHABLE: True},
+        entry_id="offline_quiet",
+    )
+    config_entry.add_to_hass(hass)
+
+    with (
+        patch(
+            "custom_components.moonraker._async_is_tcp_reachable",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        caplog.at_level(logging.DEBUG),
+        pytest.raises(ConfigEntryNotReady),
+    ):
+        await async_setup_entry(hass, config_entry)
+
+    assert "Cannot configure moonraker instance" in caplog.text
+    assert any(
+        record.levelno == logging.DEBUG
+        and "Cannot configure moonraker instance" in record.message
+        for record in caplog.records
+    )
+    assert not any(
+        record.levelno >= logging.WARNING
+        and "Cannot configure moonraker instance" in record.message
+        for record in caplog.records
+    )
+
+
+async def test_async_is_tcp_reachable_returns_true_when_connection_opens():
+    """A successful TCP connection marks the endpoint as reachable."""
+    writer = MagicMock()
+    writer.wait_closed = AsyncMock()
+
+    with patch(
+        "custom_components.moonraker.asyncio.open_connection",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(), writer),
+    ):
+        assert await _async_is_tcp_reachable("1.2.3.4", 7125) is True
+
+    writer.close.assert_called_once()
+    writer.wait_closed.assert_awaited_once()
+
+
+async def test_async_is_tcp_reachable_returns_false_when_connection_fails():
+    """Connection errors mark the endpoint as unreachable."""
+    with patch(
+        "custom_components.moonraker.asyncio.open_connection",
+        new_callable=AsyncMock,
+        side_effect=OSError,
+    ):
+        assert await _async_is_tcp_reachable("1.2.3.4", 7125) is False
+
+
+async def test_async_fetch_data_unreachable_raises_update_failed(hass):
+    """Fetching while disconnected and unreachable raises UpdateFailed."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+
+    with (
+        patch(
+            "custom_components.moonraker._async_is_tcp_reachable",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator.async_fetch_data(METHODS.PRINTER_INFO)
+
+    assert await async_unload_entry(hass, config_entry)
+
+
+async def test_async_fetch_data_times_out(hass):
+    """A stalled Moonraker method should fail within the configured timeout."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="timeout")
+    client = MagicMock()
+    client.client.is_connected = True
+
+    async def wait_forever(*_args, **_kwargs):
+        """Keep the mocked API request pending until timeout cancellation."""
+        await asyncio.Event().wait()
+
+    client.client.call_method = AsyncMock(side_effect=wait_forever)
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=client, config_entry=config_entry, api_device_name="printer"
+    )
+
+    with (
+        patch("custom_components.moonraker.TIMEOUT", 0.01),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator.async_fetch_data(METHODS.PRINTER_INFO)
+
+
+async def test_async_send_data_unreachable_raises_update_failed(hass):
+    """Sending while disconnected and unreachable raises UpdateFailed."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+
+    with (
+        patch(
+            "custom_components.moonraker._async_is_tcp_reachable",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator.async_send_data(METHODS.PRINTER_EMERGENCY_STOP)
+
+    assert await async_unload_entry(hass, config_entry)
+
+
+async def test_coordinator_passes_config_entry_to_super(hass):
+    """Ensure the coordinator forwards the config entry to the base class."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="config")
+
+    captured: dict[str, dict] = {}
+    original_init = DataUpdateCoordinator.__init__
+
+    def wrapped_init(self, hass_param, logger, *args, **kwargs):
+        captured["kwargs"] = dict(kwargs)
+        captured["args"] = (hass_param, logger, *args)
+        return original_init(self, hass_param, logger, *args, **kwargs)
+
+    with patch(
+        "homeassistant.helpers.update_coordinator.DataUpdateCoordinator.__init__",
+        new=wrapped_init,
+    ):
+        coordinator = MoonrakerDataUpdateCoordinator(
+            hass,
+            client=MagicMock(),
+            config_entry=config_entry,
+            api_device_name="printer",
+        )
+
+    assert captured["kwargs"]["config_entry"] is config_entry
+    assert coordinator.config_entry is config_entry
+
+
+def load_data(endpoint, *args, **kwargs):
+    """Load data."""
+    if endpoint == "printer.info":
+        return {"hostname": "mainsail"}
+
+    raise Exception
+
+
+async def test_failed_first_refresh(hass):
+    """Test ConfigEntryNotReady when API raises an exception during entry setup."""
+    with (
+        patch(
+            "custom_components.moonraker.MoonrakerApiClient.stop",
+            new_callable=AsyncMock,
+        ) as stop_client,
+        patch(
+            "moonraker_api.MoonrakerClient.call_method",
+            side_effect=load_data,
+        ),
+    ):
+        config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+        config_entry.add_to_hass(hass)
+
+        with pytest.raises(ConfigEntryNotReady):
+            assert await async_setup_entry(hass, config_entry)
+
+    stop_client.assert_awaited_once()
+
+
+async def test_set_custom_gcode_service(hass):
+    """Test custom GCode Services."""
+
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test")
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    device_id = list(hass.data["device_registry"].devices.keys())
+
+    # Test that the function call works in its entirety.
+    with patch(
+        "moonraker_api.MoonrakerClient.call_method", new_callable=AsyncMock
+    ) as mock_sensors:
+        await hass.services.async_call(
+            DOMAIN,
+            "send_gcode",
+            {
+                "device_id": device_id,
+                "gcode": "STATUS",
+            },
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+        mock_sensors.assert_awaited_with(
+            METHODS.PRINTER_GCODE_SCRIPT.value, script="STATUS"
+        )
+
+
+async def test_send_gcode_list_payload_normalizes_script(hass):
+    """Ensure list payloads join into a single script."""
+
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, entry_id="list_payload"
+    )
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    device_ids = list(hass.data["device_registry"].devices.keys())
+    target_device_id = device_ids[0]
+
+    with patch(
+        "moonraker_api.MoonrakerClient.call_method", new_callable=AsyncMock
+    ) as mock_call:
+        await hass.services.async_call(
+            DOMAIN,
+            "send_gcode",
+            {
+                "device_id": target_device_id,
+                "gcode": ["G28", "M105"],
+            },
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+
+    mock_call.assert_awaited_with(
+        METHODS.PRINTER_GCODE_SCRIPT.value, script="G28\nM105"
+    )
+    assert await async_unload_entry(hass, config_entry)
+
+
+async def test_send_gcode_empty_payload_skips_send(hass):
+    """Ensure empty payloads do not call Moonraker."""
+
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, entry_id="empty_payload"
+    )
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    device_ids = list(hass.data["device_registry"].devices.keys())
+
+    with patch(
+        "moonraker_api.MoonrakerClient.call_method", new_callable=AsyncMock
+    ) as mock_call:
+        await hass.services.async_call(
+            DOMAIN,
+            "send_gcode",
+            {
+                "device_id": device_ids,
+                "gcode": ["   ", ""],
+            },
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+
+    assert mock_call.await_count == 0
+    assert await async_unload_entry(hass, config_entry)
+
+
+async def test_send_gcode_accepts_config_entry_id_and_deduplicates(hass):
+    """Ensure config entry IDs are accepted and deduplicated."""
+
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, entry_id="entry_fallback"
+    )
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    device_ids = list(hass.data["device_registry"].devices.keys())
+    primary_device_id = device_ids[0]
+
+    with patch(
+        "moonraker_api.MoonrakerClient.call_method", new_callable=AsyncMock
+    ) as mock_call:
+        await hass.services.async_call(
+            DOMAIN,
+            "send_gcode",
+            {
+                "device_id": [primary_device_id, config_entry.entry_id],
+                "gcode": "G0",
+            },
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+
+    gcode_calls = [
+        call
+        for call in mock_call.await_args_list
+        if call.args[0] == METHODS.PRINTER_GCODE_SCRIPT.value
+    ]
+    assert len(gcode_calls) == 1
+    assert gcode_calls[0].kwargs == {"script": "G0"}
+    assert await async_unload_entry(hass, config_entry)
+
+
+async def test_send_gcode_identifier_fallback(hass):
+    """Ensure identifiers populate entry IDs when config entries are missing."""
+
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, entry_id="identifier_fallback"
+    )
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    dev_reg = dr.async_get(hass)
+    original_async_get = dev_reg.async_get
+    identifier_device_id = "identifier-device"
+    identifier_device = SimpleNamespace(
+        config_entries=set(),
+        primary_config_entry=None,
+        identifiers={(DOMAIN, config_entry.entry_id)},
+    )
+
+    def async_get_override(device_id):
+        if device_id == identifier_device_id:
+            return identifier_device
+        return original_async_get(device_id)
+
+    with (
+        patch.object(dev_reg, "async_get", side_effect=async_get_override),
+        patch(
+            "moonraker_api.MoonrakerClient.call_method", new_callable=AsyncMock
+        ) as mock_call,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            "send_gcode",
+            {
+                "device_id": [identifier_device_id],
+                "gcode": "M105",
+            },
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+
+    mock_call.assert_awaited_with(METHODS.PRINTER_GCODE_SCRIPT.value, script="M105")
+    assert await async_unload_entry(hass, config_entry)
+
+
+async def test_send_gcode_skips_device_without_entries(hass):
+    """Skip devices that cannot be linked to config entries."""
+
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, entry_id="orphan_device"
+    )
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    dev_reg = dr.async_get(hass)
+    original_async_get = dev_reg.async_get
+    orphan_device_id = "orphan-device"
+    orphan_device = SimpleNamespace(
+        config_entries=set(),
+        primary_config_entry=None,
+        identifiers=set(),
+    )
+
+    def async_get_override(device_id):
+        if device_id == orphan_device_id:
+            return orphan_device
+        return original_async_get(device_id)
+
+    with (
+        patch.object(dev_reg, "async_get", side_effect=async_get_override),
+        patch(
+            "moonraker_api.MoonrakerClient.call_method", new_callable=AsyncMock
+        ) as mock_call,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            "send_gcode",
+            {
+                "device_id": [orphan_device_id],
+                "gcode": "G90",
+            },
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+
+    assert mock_call.await_count == 0
+    assert await async_unload_entry(hass, config_entry)
+
+
+async def test_send_gcode_skips_unloaded_entries(hass):
+    """Skip devices whose entries are not currently loaded."""
+
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, entry_id="missing_entry"
+    )
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    dev_reg = dr.async_get(hass)
+    original_async_get = dev_reg.async_get
+    missing_device_id = "missing-device"
+    missing_device = SimpleNamespace(
+        config_entries={"ghost-entry"},
+        primary_config_entry=None,
+        identifiers=set(),
+    )
+
+    def async_get_override(device_id):
+        if device_id == missing_device_id:
+            return missing_device
+        return original_async_get(device_id)
+
+    with (
+        patch.object(dev_reg, "async_get", side_effect=async_get_override),
+        patch(
+            "moonraker_api.MoonrakerClient.call_method", new_callable=AsyncMock
+        ) as mock_call,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            "send_gcode",
+            {
+                "device_id": [missing_device_id],
+                "gcode": "G91",
+            },
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+
+    assert mock_call.await_count == 0
+    assert await async_unload_entry(hass, config_entry)
+
+
+async def test_send_gcode_unknown_device_is_ignored(hass):
+    """Unknown device IDs should be ignored."""
+
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, entry_id="unknown_device"
+    )
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with patch(
+        "moonraker_api.MoonrakerClient.call_method", new_callable=AsyncMock
+    ) as mock_call:
+        await hass.services.async_call(
+            DOMAIN,
+            "send_gcode",
+            {
+                "device_id": "unknown-device",
+                "gcode": "M115",
+            },
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+
+    assert mock_call.await_count == 0
+    assert await async_unload_entry(hass, config_entry)
+
+
+@pytest.mark.asyncio
+async def test_polling_interval_changes_on_print_state(hass, get_data):
+    """Test polling interval changes based on print state transitions."""
+    from custom_components.moonraker.const import DOMAIN
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+    from .const import MOCK_CONFIG
+
+    # Set initial state to standby
+    get_data["status"]["print_stats"]["state"] = PRINTSTATES.STANDBY.value
+
+    # Setup coordinator
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, entry_id="test_polling"
+    )
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+
+    # Default should be 40 seconds
+    assert coordinator.update_interval == timedelta(seconds=40)
+
+    with patch.object(coordinator, "_schedule_refresh") as mock_refresh:
+        # Simulate a state change to printing
+        get_data["status"]["print_stats"]["state"] = PRINTSTATES.PRINTING.value
+        await coordinator._async_update_data()
+        assert coordinator.update_interval == _PRINTING_SCAN_INTERVAL
+        assert mock_refresh.called
+
+        mock_refresh.reset_mock()
+
+        # Simulate a state change back to standby
+        get_data["status"]["print_stats"]["state"] = PRINTSTATES.STANDBY.value
+        await coordinator._async_update_data()
+        assert coordinator.update_interval == timedelta(seconds=40)
+        assert mock_refresh.called
+
+        mock_refresh.reset_mock()
+
+        # Simulate no state change (still standby)
+        await coordinator._async_update_data()
+        # Should not call _schedule_refresh again
+        assert not mock_refresh.called
+
+
+@pytest.mark.asyncio
+async def test_polling_interval_no_change_on_same_state(hass, get_data):
+    """Test polling interval does not change or reschedule if state is unchanged."""
+    from custom_components.moonraker.const import DOMAIN
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+    from .const import MOCK_CONFIG
+
+    get_data["status"]["print_stats"]["state"] = PRINTSTATES.STANDBY.value
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, entry_id="test_polling2"
+    )
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+
+    with patch.object(coordinator, "_schedule_refresh") as mock_refresh:
+        # Call update with the same state
+        await coordinator._async_update_data()
+        assert not mock_refresh.called
+        assert coordinator.update_interval == timedelta(seconds=40)
+
+
+async def test_polling_interval_uses_per_entry_option(hass, get_data):
+    """A custom idle poll rate should be restored after printing."""
+    get_data["status"]["print_stats"]["state"] = PRINTSTATES.STANDBY.value
+    config_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CONFIG,
+        options={CONF_OPTION_POLLING_RATE: 45},
+        entry_id="custom_polling",
+    )
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+
+    assert coordinator.update_interval == timedelta(seconds=60)
+
+    with patch.object(coordinator, "_schedule_refresh"):
+        get_data["status"]["print_stats"]["state"] = PRINTSTATES.PRINTING.value
+        await coordinator._async_update_data()
+        assert coordinator.update_interval == _PRINTING_SCAN_INTERVAL
+
+        get_data["status"]["print_stats"]["state"] = PRINTSTATES.STANDBY.value
+        await coordinator._async_update_data()
+        assert coordinator.update_interval == timedelta(seconds=60)
+
+
+async def test_start_print_service(hass):
+    """The start_print service should send printer.print.start."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_CONFIG, entry_id="start_print"
+    )
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    device_id = list(hass.data["device_registry"].devices.keys())
+
+    with patch(
+        "moonraker_api.MoonrakerClient.call_method", new_callable=AsyncMock
+    ) as mock_call:
+        await hass.services.async_call(
+            DOMAIN,
+            "start_print",
+            {"device_id": device_id, "filename": "benchy.gcode"},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+        mock_call.assert_awaited_with(
+            METHODS.PRINTER_PRINT_START.value, filename="benchy.gcode"
+        )
+
+
+async def test_upload_gcode_rejects_unlisted_path(hass):
+    """upload_gcode refuses paths outside allowlisted directories."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="upload")
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    device_id = list(hass.data["device_registry"].devices.keys())
+
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(
+            DOMAIN,
+            "upload_gcode",
+            {"device_id": device_id, "path": "/etc/passwd"},
+            blocking=True,
+        )
+
+
+async def test_refresh_files_updates_file_list(hass):
+    """async_refresh_files stores the file list and notifies listeners."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="files")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator._async_fetch_data = AsyncMock(
+        return_value={"files": [{"path": "a.gcode"}]}
+    )
+    coordinator.async_update_listeners = MagicMock()
+
+    await coordinator.async_refresh_files()
+
+    assert coordinator.data["file_list"] == {"files": [{"path": "a.gcode"}]}
+    coordinator.async_update_listeners.assert_called_once()
+
+
+async def test_upload_gcode_data_posts_to_http_api(hass):
+    """async_upload_gcode_data posts a multipart form and refreshes files."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="updata")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+    coordinator.async_refresh_files = AsyncMock()
+
+    response = MagicMock()
+    post_cm = MagicMock()
+    post_cm.__aenter__ = AsyncMock(return_value=response)
+    post_cm.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.post = MagicMock(return_value=post_cm)
+
+    with patch(
+        "custom_components.moonraker.async_get_clientsession",
+        return_value=session,
+    ):
+        await coordinator.async_upload_gcode_data(b"G28\n", "benchy.gcode")
+
+    session.post.assert_called_once()
+    call_args, call_kwargs = session.post.call_args
+    assert call_args[0].endswith("/server/files/upload")
+    coordinator.async_refresh_files.assert_awaited_once()
+
+
+async def test_gcode_response_buffered(hass):
+    """notify_gcode_response should be buffered for the console."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="gcr")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="printer"
+    )
+
+    await coordinator._async_handle_notification(
+        NOTIFY_GCODE_RESPONSE, ["// T0:210.0 /210.0"]
+    )
+    await coordinator._async_handle_notification(NOTIFY_GCODE_RESPONSE, ["ok"])
+
+    assert list(coordinator.gcode_responses) == ["// T0:210.0 /210.0", "ok"]
+
+
+def test_normalize_file_list_shapes():
+    """server.files.list replies normalize to a dict with a files key."""
+    from custom_components.moonraker import _normalize_file_list
+
+    assert _normalize_file_list([{"path": "a"}]) == {"files": [{"path": "a"}]}
+    assert _normalize_file_list({"files": [1]}) == {"files": [1]}
+    assert _normalize_file_list("garbage") == {"files": []}
+
+
+def test_read_file_bytes(tmp_path):
+    """_read_file_bytes reads raw bytes from disk."""
+    from custom_components.moonraker import _read_file_bytes
+
+    target = tmp_path / "part.gcode"
+    target.write_bytes(b"G28\n")
+    assert _read_file_bytes(str(target)) == b"G28\n"
+
+
+def test_normalize_gcode_path_rejects_traversal():
+    """Traversal and empty path segments never reach Moonraker."""
+    assert _normalize_gcode_path("../x.gcode") == ("", None)
+    assert _normalize_gcode_path("a//b.gcode") == ("", None)
+    assert _normalize_gcode_path("./a.gcode") == ("", None)
+    assert _normalize_gcode_path("gcodes/sub/a.gcode") == ("sub/a.gcode", "gcodes")
+
+
+class _Part:
+    """Minimal aiohttp multipart part stand-in."""
+
+    def __init__(self, name, filename=None, data=b"", text=""):
+        self.name = name
+        self.filename = filename
+        self._data = data
+        self._text = text
+
+    async def read(self, decode=False):
+        return self._data
+
+    async def text(self):
+        return self._text
+
+
+class _MultipartRequest(dict):
+    def __init__(self, parts, is_admin=True):
+        super().__init__({"hass_user": SimpleNamespace(is_admin=is_admin)})
+        self._parts = parts
+
+    async def multipart(self):
+        async def _iter():
+            for part in self._parts:
+                yield part
+
+        return _iter()
+
+
+async def test_gcode_upload_view(hass):
+    """The upload endpoint validates and forwards files to Moonraker."""
+    from custom_components.moonraker import MoonrakerGcodeUploadView
+
+    coordinator = MagicMock(spec=MoonrakerDataUpdateCoordinator)
+    coordinator.async_upload_gcode_data = AsyncMock()
+    coordinator.async_send_data = AsyncMock()
+    hass.data[DOMAIN] = {"p": coordinator}
+
+    view = MoonrakerGcodeUploadView(hass)
+
+    # Unknown printer id
+    response = await view.post(_MultipartRequest([]))
+    assert response.status == 404
+
+    parts = [
+        _Part("file", filename="part.gcode", data=b"G28"),
+        _Part("printer", text="p"),
+        _Part("start_print"),
+    ]
+    response = await view.post(_MultipartRequest(parts))
+    assert response.status == 200
+    coordinator.async_upload_gcode_data.assert_awaited_once_with(b"G28", "part.gcode")
+    coordinator.async_send_data.assert_awaited_once_with(
+        METHODS.PRINTER_PRINT_START, {"filename": "part.gcode"}
+    )
+
+    # Missing file part -> 400
+    response = await view.post(_MultipartRequest([_Part("printer", text="p")]))
+    assert response.status == 400
+
+    # Upload failure -> 502
+    coordinator.async_upload_gcode_data = AsyncMock(side_effect=RuntimeError("io"))
+    parts = [
+        _Part("file", filename="part.gcode", data=b"G28"),
+        _Part("printer", text="p"),
+    ]
+    response = await view.post(_MultipartRequest(parts))
+    assert response.status == 502
+
+
+async def test_gcode_upload_view_requires_admin(hass):
+    """Non-admin users cannot upload G-code through the endpoint."""
+    from homeassistant.exceptions import Unauthorized
+
+    from custom_components.moonraker import MoonrakerGcodeUploadView
+
+    coordinator = MagicMock(spec=MoonrakerDataUpdateCoordinator)
+    coordinator.async_upload_gcode_data = AsyncMock()
+    hass.data[DOMAIN] = {"p": coordinator}
+
+    view = MoonrakerGcodeUploadView(hass)
+    parts = [
+        _Part("file", filename="part.gcode", data=b"G28"),
+        _Part("printer", text="p"),
+    ]
+    with pytest.raises(Unauthorized):
+        await view.post(_MultipartRequest(parts, is_admin=False))
+    coordinator.async_upload_gcode_data.assert_not_called()
+
+
+async def test_resolve_entry_ids_variants(hass):
+    """Device ids resolve via registry, direct entry ids, and identifiers."""
+    from custom_components.moonraker import _async_resolve_entry_ids
+
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="p")
+    hass.data[DOMAIN] = {"p": config_entry}
+
+    # Plain entry id with no device -> resolved directly
+    assert _async_resolve_entry_ids(hass, "p") == ["p"]
+    # Unknown everything -> skipped
+    assert _async_resolve_entry_ids(hass, "ghost") == []
+    # String vs list input
+    assert _async_resolve_entry_ids(hass, ["p", "ghost"]) == ["p"]
+
+
+async def test_setup_entry_tolerates_optional_refresh_failures(hass):
+    """Bed-mesh prefetch and status subscription failures don't block setup."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="x")
+    config_entry.add_to_hass(hass)
+
+    with (
+        patch.object(
+            MoonrakerDataUpdateCoordinator,
+            "async_get_printer_objects",
+            new=AsyncMock(return_value={"objects": ["bed_mesh", "extruder"]}),
+        ),
+        patch.object(
+            MoonrakerDataUpdateCoordinator,
+            "async_refresh_query_data",
+            new=AsyncMock(side_effect=UpdateFailed("mesh")),
+        ),
+        patch.object(
+            MoonrakerDataUpdateCoordinator,
+            "async_subscribe_status_updates",
+            new=AsyncMock(side_effect=UpdateFailed("sub")),
+        ),
+    ):
+        await hass.config_entries.async_setup(config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert config_entry.state.name == "LOADED"
+
+
+async def test_start_print_requires_filename(hass):
+    """start_print rejects empty filenames before touching the printer."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="x")
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(
+            DOMAIN,
+            "start_print",
+            {"device_id": ["x"], "filename": "  "},
+            blocking=True,
+        )
+
+
+async def test_fetch_and_send_resubscribe_failure_raises(hass):
+    """A failed resubscribe during reconnect surfaces as UpdateFailed."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="x")
+    client = MagicMock()
+    client.start = AsyncMock()
+    client.client.is_connected = False
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=client, config_entry=config_entry, api_device_name="p"
+    )
+    coordinator._subscribed_to_status = True
+    coordinator._async_resubscribe = AsyncMock(side_effect=RuntimeError("nope"))
+
+    with pytest.raises(UpdateFailed):
+        await coordinator._async_fetch_data(METHODS.PRINTER_INFO, None)
+    with pytest.raises(UpdateFailed):
+        await coordinator._async_send_data(METHODS.PRINTER_INFO, None)
+
+
+async def test_get_webcams_caches_single_fetch(hass):
+    """Webcams are fetched once and cached for the entry lifetime."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="x")
+    client = MagicMock()
+    client.client.is_connected = True
+    client.client.call_method = AsyncMock(return_value={"webcams": [{"name": "cam"}]})
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=client, config_entry=config_entry, api_device_name="p"
+    )
+
+    assert await coordinator.async_get_webcams() == {"webcams": [{"name": "cam"}]}
+    assert await coordinator.async_get_webcams() == {"webcams": [{"name": "cam"}]}
+    client.client.call_method.assert_awaited_once()
+
+
+async def test_upload_gcode_posts_to_moonraker(hass, tmp_path):
+    """async_upload_gcode reads the file in the executor and posts it."""
+
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="x")
+    client = MagicMock()
+    client.client.is_connected = True
+    client.client.call_method = AsyncMock(return_value={"files": []})
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=client, config_entry=config_entry, api_device_name="p"
+    )
+    coordinator.data = {}
+
+    target = tmp_path / "part.gcode"
+    target.write_bytes(b"G28\n")
+
+    class _Ctx:
+        def __init__(self, response):
+            self._response = response
+
+        async def __aenter__(self):
+            return self._response
+
+        async def __aexit__(self, *_):
+            return False
+
+    session = MagicMock()
+    upstream = MagicMock()
+    upstream.raise_for_status = MagicMock()
+    session.post = MagicMock(return_value=_Ctx(upstream))
+
+    with patch(
+        "custom_components.moonraker.async_get_clientsession", return_value=session
+    ):
+        await coordinator.async_upload_gcode(str(target))
+
+    session.post.assert_called_once()
+    assert session.post.call_args.args[0].endswith("/server/files/upload")
+    # file list refresh was triggered
+    client.client.call_method.assert_awaited()
+
+
+async def test_empty_subscriptions_are_noops(hass):
+    """Empty subscription maps short-circuit both subscribe and resubscribe."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="x")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="p"
+    )
+    coordinator.query_obj = {OBJ: {}}
+    coordinator._async_fetch_data = AsyncMock()
+
+    await coordinator.async_subscribe_status_updates()
+    coordinator._async_fetch_data.assert_not_awaited()
+
+    coordinator._subscribed_to_status = True
+    await coordinator._async_resubscribe()
+    coordinator._async_fetch_data.assert_not_awaited()
+    coordinator.moonraker.client.call_method.assert_not_called()
+
+
+async def test_status_delta_accepts_dict_and_list(hass):
+    """_status_delta unwraps dict replies and ignores empty data."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="x")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="p"
+    )
+
+    assert coordinator._status_delta([{"a": 1}, 2.0]) == {"a": 1}
+    assert coordinator._status_delta({"status": {"a": 1}}) == {"a": 1}
+    assert coordinator._status_delta({"x": 1}) == {"x": 1}
+    assert coordinator._status_delta([]) == {}
+
+
+async def test_notification_guards(hass):
+    """Empty deltas and unchanged merges short-circuit notification handling."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="x")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="p"
+    )
+    coordinator.data = {"status": {"print_stats": {"state": "printing"}}}
+    coordinator.async_update_listeners = MagicMock()
+
+    # Empty delta -> nothing happens
+    await coordinator._async_handle_notification(NOTIFY_STATUS_UPDATE, [])
+    coordinator.async_update_listeners.assert_not_called()
+
+    # Unchanged merge -> nothing happens
+    await coordinator._async_handle_notification(
+        NOTIFY_STATUS_UPDATE, [{"print_stats": {"state": "printing"}}, 1.0]
+    )
+    coordinator.async_update_listeners.assert_not_called()
+
+
+async def test_push_flush_with_no_data_returns(hass):
+    """The push flush bails cleanly when no data exists yet."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="x")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="p"
+    )
+    coordinator.data = None
+    await coordinator._async_flush_push_data()
+
+
+async def test_push_flush_filename_change_triggers_refresh(hass):
+    """A new filename in pushed data schedules a metadata refresh."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="x")
+    coordinator = MoonrakerDataUpdateCoordinator(
+        hass, client=MagicMock(), config_entry=config_entry, api_device_name="p"
+    )
+    coordinator.data = {"status": {"print_stats": {"filename": "new.gcode"}}}
+    coordinator.async_update_listeners = MagicMock()
+    coordinator.async_request_refresh = AsyncMock()
+
+    await coordinator._async_flush_push_data()
+    coordinator.async_request_refresh.assert_awaited_once()
+
+
+async def test_upload_gcode_service_uploads_via_coordinator(hass, tmp_path):
+    """The upload_gcode service forwards an allowlisted path to Moonraker."""
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="x")
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator.async_upload_gcode = AsyncMock()
+
+    target = tmp_path / "part.gcode"
+    target.write_bytes(b"G28\n")
+
+    with patch.object(hass.config, "is_allowed_path", return_value=True):
+        await hass.services.async_call(
+            DOMAIN,
+            "upload_gcode",
+            {"device_id": [config_entry.entry_id], "path": str(target)},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+
+    coordinator.async_upload_gcode.assert_awaited_once_with(str(target))
+
+
+async def test_setup_tolerates_config_settings_failure(hass):
+    """Setup proceeds when the printer configfile query fails."""
+    from homeassistant.helpers.update_coordinator import UpdateFailed
+
+    config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="cfgfail")
+    config_entry.add_to_hass(hass)
+
+    with patch(
+        "custom_components.moonraker.MoonrakerDataUpdateCoordinator.async_get_config_settings",
+        new_callable=AsyncMock,
+        side_effect=UpdateFailed(),
+    ):
+        await hass.config_entries.async_setup(config_entry.entry_id)
+    assert config_entry.entry_id in hass.data[DOMAIN]

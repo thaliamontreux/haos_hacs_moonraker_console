@@ -1,0 +1,70 @@
+name: CI actions
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: "ubuntu-latest"
+    name: Validate
+    steps:
+      - uses: "actions/checkout@v7"
+
+      - name: HACS validation
+        uses: "hacs/action@main"
+        with:
+          category: "integration"
+          ignore: brands
+
+      - name: Hassfest validation
+        uses: "home-assistant/actions/hassfest@master"
+
+  ruff:
+    name: "Ruff"
+    runs-on: "ubuntu-latest"
+    steps:
+      - name: "Checkout the repository"
+        uses: "actions/checkout@v7"
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: "pip"
+
+      - name: "Install requirements"
+        run: python3 -m pip install -r requirements.txt
+
+      - name: "Run"
+        run: python3 -m ruff check .
+
+  tests:
+    runs-on: "ubuntu-latest"
+    name: Run tests
+    permissions:
+      contents: write
+    steps:
+      - name: Check out code from GitHub
+        uses: "actions/checkout@v7"
+      - name: Setup Python
+        uses: "actions/setup-python@v6"
+        with:
+          python-version: "3.14"
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install requirements
+        run: python3 -m pip install -r requirements.txt
+      - name: Run strict Python and panel UI tests
+        run: scripts/test_strict
+      - name: Upload coverage reports to Codecov with GitHub Action
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}

@@ -1,0 +1,56 @@
+{
+  "version": "2.0.0",
+  "inputs": [
+    {
+      "id": "bumpLevel",
+      "type": "pickString",
+      "description": "Select bump2version level",
+      "options": ["patch", "minor", "major"],
+      "default": "patch"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "Setup environment",
+      "type": "shell",
+      "command": "scripts/setup",
+      "problemMatcher": []
+    },
+    {
+      "label": "Run Home Assistant on port 8123",
+      "type": "shell",
+      "command": "scripts/develop",
+      "problemMatcher": []
+    },
+    {
+      "label": "Run strict tests",
+      "type": "shell",
+      "command": "scripts/test_strict",
+      "problemMatcher": []
+    },
+    {
+      "label": "Run pre-commit hook",
+      "type": "shell",
+      "command": "pre-commit run --all-files",
+      "problemMatcher": []
+    },
+    {
+      "label": "Run prepush checks",
+      "type": "shell",
+      "command": "scripts/prepush",
+      "problemMatcher": []
+    },
+    {
+      "label": "Generate documentation",
+      "type": "shell",
+      "command": "scripts/docs_build && echo http://127.0.0.1:3000/docs/_build/index.html",
+      "problemMatcher": []
+    },
+    {
+      "label": "Version bump",
+      "type": "shell",
+      "command": "scripts/version_bump ${input:bumpLevel}",
+      "problemMatcher": []
+    }
+  ]
+}
